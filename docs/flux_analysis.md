@@ -23,7 +23,7 @@ that guide.
 from models import flux_timeseries
 
 flux = flux_timeseries(model, sol.t, sol.y, params, gp, forcing)
-# -> {"rain_in": array(N), "e_h": array(N), "q_hl": array(N)}
+# -> {"rain_in": array(N), "e_h": array(N), "q_hl": array(N), "q_out": array(N)}
 ```
 
 - It re-evaluates `model.fluxes` at every time in `t`, using the solved
@@ -49,7 +49,7 @@ change only the key tuples. Nothing else is model-specific:
 t_h = sol.t / 60.0
 fig, (ax_q, ax_s, ax_f) = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
 
-ax_q.plot(t_h, sol.y[0], lw=2.5, label="q (channel)")
+ax_q.plot(t_h, flux["q_out"], lw=2.5, label="q_out (hillslope)")
 ax_q.set_ylabel("discharge [m³/s]")
 
 for name in ("s_h",):                                  # <- your storages
@@ -66,8 +66,8 @@ for ax in (ax_q, ax_s, ax_f):
 ax_f.set_xlabel("time [h]")
 ```
 
-If your model has **no routed channel state**, as in CRB3, plot an outflow
-flux converted to m³/s instead, for example `flux["q_out"]` or
+Streamflow is the model's outflow flux in m³/s, `flux["q_out"]` in every
+current model. Any single hillslope flux converts the same way, for example
 `flux["q_hl"] * params[6]` (`params[6]` is `c_2`).
 
 ---
@@ -76,16 +76,17 @@ flux converted to m³/s instead, for example `flux["q_out"]` or
 
 Before writing the balance, sort your model's terms into three groups:
 
-| Group | What goes in it | LR1 | 254 / 255 | CRB3 |
+| Group | What goes in it | LR1 | TopLayer | CRB3 |
 |---|---|---|---|---|
 | **Inputs** (fluxes into the hillslope) | rain, irrigation, ... | `rain_in` | `rain_in` | `rain_in` |
 | **Outputs** (fluxes leaving the hillslope) | flows to channel, evaporation | `q_hl`, `e_h` | `q_pl`, `q_sl`, `e_p`, `e_t`, `e_s` | `q_pL`, `q_sL`, `q_gL`, `e_b`, `e_v` |
 | **Storages** (hillslope states, in m) | | `s_h` | `s_p`, `s_t`, `s_s` | `s_s`, `s_p`, `s_g` |
 
 **Leave out internal transfers.** Fluxes between two hillslope storages
-(254's `q_pt`, `q_ts`, CRB3's `q_sp`, `q_ss`, `q_sg`) cancel out. Also leave
-out non-water states: the channel `q`, base flow `q_b`, and accumulators such
-as `s_precip`, `V_r` or CRB3's `Q`.
+(TopLayer's `q_pt`, `q_ts`, CRB3's `q_sp`, `q_ss`, `q_sg`) cancel out. Also
+leave out states that are not hillslope water: cumulative-runoff
+accumulators such as CRB3's `Q` or ConstantRunoff's `surf_runoff` and
+`total_runoff`.
 
 ---
 
@@ -125,7 +126,7 @@ pd.Series(water_balance(model, sol, params, gp, forcing,
 The same call reproduces the existing models' balances:
 
 ```python
-water_balance(m254, sol, p, gp, forcing, ["rain_in"],
+water_balance(mtop, sol, p, gp, forcing, ["rain_in"],
               ["q_pl", "q_sl", "e_p", "e_t", "e_s"], ["s_p", "s_t", "s_s"])
 water_balance(mcrb, sol, p, gp, forcing, ["rain_in"],
               ["q_pL", "q_sL", "q_gL", "e_b", "e_v"], ["s_s", "s_p", "s_g"])
@@ -149,28 +150,24 @@ The OAT cells need three model-specific pieces:
 
 ```python
 # 1. index -> name for your global-parameter layout
-LR1_GP_NAMES = {0: "v_0", 1: "lambda_1", 3: "v_h", 4: "S_max"}
+LR1_GP_NAMES = {i: name for i, (name, unit) in enumerate(model.param_names)}
 
 # 2. index -> sweep values (use np.geomspace for parameters spanning decades)
 lr1_sweep_ranges = {
-    0: np.linspace(0.1, 0.6, 11),     # v_0
-    1: np.linspace(0.1, 0.6, 11),     # lambda_1
-    3: np.linspace(0.005, 0.1, 11),   # v_h
-    4: np.linspace(0.02, 0.5, 11),    # S_max
+    0: np.linspace(0.005, 0.1, 11),   # v_h
+    1: np.linspace(0.02, 0.5, 11),    # S_max
 }
 
 # 3. the response to measure: streamflow in m³/s at the solver times
 def lr1_q(sol, params, gp):
-    return sol.y[0]                   # routed channel state
-    # no channel state? use a flux instead, e.g.:
-    # return flux_timeseries(model, sol.t, sol.y, params, gp, forcing)["q_out"]
+    return flux_timeseries(model, sol.t, sol.y, params, gp, forcing)["q_out"]
 ```
 
 Then reuse the notebook's metric loop with these names:
 
 ```python
 def lr1_run(gp):
-    p = precalculations(L, A_h, A_i, gp)
+    p = precalculations_basic(L, A_h, A_i, gp)
     s = solve_ivp(model.dydt, (0.0, forcing.t_end), y0, args=(p, gp, forcing),
                   method="LSODA", rtol=1e-6, atol=1e-9, max_step=30.0)
     return s, p
@@ -187,8 +184,8 @@ def lr1_metrics(gp):
 The loop that builds the elasticity table (`%Δoutput / %Δparam`) and the
 plots below it is the same code as the `hlm_` and `crb_` sections. Copy it
 and replace the prefix. If some parameter combinations are physically
-invalid (255 requires `S_L < h_b` and `Ssmin < Ssmax`), add a `_valid(gp)`
-filter as in the 255 section.
+invalid (TopLayer requires `S_L < h_b` and `Ssmin < Ssmax`), add a
+`_valid(gp)` filter as in the TopLayer section.
 
 ## 5. Interactive hydrograph sweep
 
@@ -209,7 +206,8 @@ black, legend groups per parameter) is model-independent.
    variable prefix (e.g. `lr1_`) so sections don't overwrite each other.
 2. Get the model with `get_model`, copy its default `GLOBAL_PARAMS_*`, set
    `y0`, and `assert len(y0) == model.dim`.
-3. Write a `<prefix>_run(gp)` wrapper around `solve_ivp`
+3. Write a `<prefix>_run(gp)` wrapper around `solve_ivp` (or call
+   `models.simulate`)
    (`dense_output=True`).
 4. Compute `flux_timeseries`, and plot it with your own state and flux keys.
 5. Run `water_balance` with your input, output and storage lists, and check
@@ -219,4 +217,4 @@ black, legend groups per parameter) is model-independent.
 
 To compare models directly, run them with the **same `forcing` object and
 link geometry** (`L`, `A_h`, `A_i`). The CRB3 section does this with the
-model 255 section's forcing.
+TopLayer section's forcing.
